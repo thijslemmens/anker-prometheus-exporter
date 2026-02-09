@@ -1,0 +1,9 @@
+cryptography
+aiohttp
+aiofiles
+paho-mqtt
+python-dotenv
+pyyaml
+prometheus-client
+fastapi
+uvicorn

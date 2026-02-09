@@ -1,0 +1,11 @@
+services:
+  exporter:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ANKER_EMAIL=${ANKER_EMAIL}
+      - ANKER_PASSWORD=${ANKER_PASSWORD}
+      - METRICS_PORT=8000
+      - REFRESH_INTERVAL=60
+    restart: unless-stopped
