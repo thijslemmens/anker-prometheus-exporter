@@ -10,6 +10,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 METRICS_PORT = int(os.getenv("METRICS_PORT", "8000"))
 REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "60"))
+SAMPLE_INTERVAL = int(os.getenv("SAMPLE_INTERVAL", "10"))
 ANKER_EMAIL = os.getenv("ANKER_USER")
 ANKER_PASSWORD = os.getenv("ANKER_PASSWORD")
 
@@ -22,6 +23,8 @@ anker_energy = Gauge("anker_battery_energy_wh", "Current battery energy", ["devi
 anker_charging_power = Gauge("anker_charging_power_w", "Charging power", ["device_name", "device_sn"])
 anker_bat_charge_power = Gauge("anker_bat_charge_power_w", "Battery charge power", ["device_name", "device_sn"])
 anker_bat_discharge_power = Gauge("anker_bat_discharge_power_w", "Battery discharge power", ["device_name", "device_sn"])
+anker_bat_charge_power_avg = Gauge("anker_bat_charge_power_avg_w", "Battery charge power (1-min avg)", ["device_name", "device_sn"])
+anker_bat_discharge_power_avg = Gauge("anker_bat_discharge_power_avg_w", "Battery discharge power (1-min avg)", ["device_name", "device_sn"])
 anker_solar_power_1 = Gauge("anker_solar_power_1_w", "Solar input 1", ["device_name", "device_sn"])
 anker_solar_power_2 = Gauge("anker_solar_power_2_w", "Solar input 2", ["device_name", "device_sn"])
 anker_ac_power = Gauge("anker_ac_power_w", "AC output power", ["device_name", "device_sn"])
@@ -32,27 +35,37 @@ anker_wifi_online = Gauge("anker_wifi_online", "WiFi connection status", ["devic
 device_info = Info("anker_device", "Anker device information", ["device_name", "device_sn"])
 
 
-async def fetch_metrics(session, api):
+async def sample_power(api):
+    """Fast poll: only update_sites() to get fresh power values."""
     await api.update_sites()
-    await api.update_device_details()
+    samples = {}
+    for sn, dev in api.devices.items():
+        if dev.get("type") == "solarbank":
+            name = dev.get("name", dev.get("alias", "Unknown"))
+            charge = float(dev.get("bat_charge_power", 0))
+            discharge = float(dev.get("bat_discharge_power", 0))
+            anker_bat_charge_power.labels(device_name=name, device_sn=sn).set(charge)
+            anker_bat_discharge_power.labels(device_name=name, device_sn=sn).set(discharge)
+            samples[(name, sn)] = {"charge": charge, "discharge": discharge}
+    return samples
 
+
+async def update_all_metrics(api):
+    """Full update: update_device_details() and set all metrics."""
+    await api.update_device_details()
     for sn, dev in api.devices.items():
         name = dev.get("name", dev.get("alias", "Unknown"))
-        
         if dev.get("type") == "solarbank":
             anker_soc.labels(device_name=name, device_sn=sn).set(dev.get("battery_soc", 0))
             anker_capacity.labels(device_name=name, device_sn=sn).set(dev.get("battery_capacity", 0))
             anker_energy.labels(device_name=name, device_sn=sn).set(dev.get("battery_energy", 0))
             anker_charging_power.labels(device_name=name, device_sn=sn).set(dev.get("charging_power", 0))
-            anker_bat_charge_power.labels(device_name=name, device_sn=sn).set(dev.get("bat_charge_power", 0))
-            anker_bat_discharge_power.labels(device_name=name, device_sn=sn).set(dev.get("bat_discharge_power", 0))
             anker_solar_power_1.labels(device_name=name, device_sn=sn).set(dev.get("solar_power_1", 0))
             anker_solar_power_2.labels(device_name=name, device_sn=sn).set(dev.get("solar_power_2", 0))
             anker_ac_power.labels(device_name=name, device_sn=sn).set(dev.get("ac_power", 0))
             anker_to_home_load.labels(device_name=name, device_sn=sn).set(dev.get("to_home_load", 0))
             anker_charging_status.labels(device_name=name, device_sn=sn).set(dev.get("charging_status", 0))
             anker_wifi_online.labels(device_name=name, device_sn=sn).set(1 if dev.get("wifi_online") else 0)
-
             device_info.labels(device_name=name, device_sn=sn).info({
                 "device_type": dev.get("type", ""),
                 "device_pn": dev.get("device_pn", ""),
@@ -65,6 +78,9 @@ async def run_exporter():
     session = None
     api = None
     needs_recreate = True
+    sample_buffer = {}  # keyed by (name, sn) → {"charge": [], "discharge": []}
+    samples_per_cycle = max(1, REFRESH_INTERVAL // SAMPLE_INTERVAL)
+    tick = 0
 
     while True:
         try:
@@ -74,9 +90,31 @@ async def run_exporter():
                 session = ClientSession()
                 api = AnkerSolixApi(ANKER_EMAIL, ANKER_PASSWORD, "1", session)
                 needs_recreate = False
+                sample_buffer = {}
+                tick = 0
                 print("Anker API session initialized")
 
-            await fetch_metrics(session, api)
+            samples = await sample_power(api)
+            for key, vals in samples.items():
+                if key not in sample_buffer:
+                    sample_buffer[key] = {"charge": [], "discharge": []}
+                sample_buffer[key]["charge"].append(vals["charge"])
+                sample_buffer[key]["discharge"].append(vals["discharge"])
+
+            tick += 1
+            if tick >= samples_per_cycle:
+                for (name, sn), buf in sample_buffer.items():
+                    if buf["charge"]:
+                        avg_charge = sum(buf["charge"]) / len(buf["charge"])
+                        anker_bat_charge_power_avg.labels(device_name=name, device_sn=sn).set(avg_charge)
+                    if buf["discharge"]:
+                        avg_discharge = sum(buf["discharge"]) / len(buf["discharge"])
+                        anker_bat_discharge_power_avg.labels(device_name=name, device_sn=sn).set(avg_discharge)
+                    buf["charge"].clear()
+                    buf["discharge"].clear()
+
+                await update_all_metrics(api)
+                tick = 0
 
         except InvalidCredentialsError:
             print("Authentication failed, will reauthenticate on next iteration")
@@ -86,7 +124,7 @@ async def run_exporter():
             print(f"Error fetching metrics: {e}")
             needs_recreate = True
 
-        await asyncio.sleep(REFRESH_INTERVAL)
+        await asyncio.sleep(SAMPLE_INTERVAL)
 
 
 def main():
